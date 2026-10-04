@@ -17,6 +17,7 @@ def client():
     conn = db.connect()
     conn.executescript(
         "DELETE FROM draft_rules;"
+        "DELETE FROM delivery_policy;"
         "DELETE FROM version_rules;"
         "DELETE FROM versions;"
         "DELETE FROM sqlite_sequence WHERE name = 'versions';"

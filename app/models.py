@@ -39,6 +39,17 @@ class PreviewRequest(BaseModel):
     revision: int = Field(ge=0, description="客户端所见草稿修订号")
 
 
+class PolicyUpdate(BaseModel):
+    baseline_version: int = Field(ge=1, description="基线已发布版本号")
+    candidate_version: int = Field(ge=1, description="候选已发布版本号")
+    candidate_percent: int = Field(ge=0, le=100, description="候选流量比例（整数 0–100）")
+    revision: int = Field(ge=0, description="客户端所见策略修订号（未配置时为 0）")
+
+
+class DeliverRequest(BaseModel):
+    address: str
+
+
 class ValidationFailure(Exception):
     """编辑期校验失败，message 直接作为 4xx 响应。"""
 

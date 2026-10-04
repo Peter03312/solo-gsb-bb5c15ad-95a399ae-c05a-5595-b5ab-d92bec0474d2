@@ -1,4 +1,4 @@
-"""持久层：草稿（带乐观锁修订号）与不可变发布版本。"""
+"""持久层：草稿（带乐观锁修订号）、不可变发布版本与默认投递策略（基线/候选灰度）。"""
 from __future__ import annotations
 
 import json
@@ -9,11 +9,19 @@ from .routing import Rule, RuleSet, Target
 
 
 class RevisionConflict(Exception):
-    """所见修订号与当前草稿不一致。"""
+    """所见修订号与当前修订号不一致（草稿或默认投递策略）。"""
 
-    def __init__(self, current: int):
-        super().__init__(f"revision conflict: current draft revision is {current}")
+    def __init__(self, current: int, subject: str = "draft"):
+        super().__init__(f"revision conflict: current {subject} revision is {current}")
         self.current = current
+
+
+class PolicyVersionNotFound(Exception):
+    """策略引用了不存在的已发布版本。"""
+
+    def __init__(self, version: int):
+        super().__init__(f"published version not found: {version}")
+        self.version = version
 
 
 def _row_to_rule(row: sqlite3.Row) -> Rule:
@@ -123,3 +131,57 @@ def load_ruleset(conn: sqlite3.Connection, version: int) -> RuleSet | None:
     if found is None:
         return None
     return RuleSet(found["rules"])
+
+
+# ---------- 默认投递策略（基线 / 候选灰度） ----------
+
+def get_policy(conn: sqlite3.Connection) -> dict | None:
+    """读取当前默认投递策略；从未配置时返回 None（修订号视为 0）。"""
+    row = conn.execute(
+        "SELECT revision, baseline_version, candidate_version, candidate_percent, updated_at "
+        "FROM delivery_policy WHERE id = 1"
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def replace_policy(
+    conn: sqlite3.Connection,
+    expected_revision: int,
+    baseline_version: int,
+    candidate_version: int,
+    candidate_percent: int,
+) -> dict:
+    """在同一事务内核验所见策略修订号并保存新策略。
+
+    - 未配置策略时修订号为 0，行尚不存在；
+    - 修订号不匹配抛 RevisionConflict，调用方回滚，原策略保持不变；
+    - 基线 / 候选必须都是已发布版本，否则抛 PolicyVersionNotFound（同样不改原策略）。
+    """
+    current = get_policy(conn)
+    current_revision = current["revision"] if current is not None else 0
+    if current_revision != expected_revision:
+        raise RevisionConflict(current_revision, subject="policy")
+    for version in (baseline_version, candidate_version):
+        if conn.execute("SELECT 1 FROM versions WHERE version = ?", (version,)).fetchone() is None:
+            raise PolicyVersionNotFound(version)
+    updated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    conn.execute(
+        """
+        INSERT INTO delivery_policy (id, revision, baseline_version, candidate_version, candidate_percent, updated_at)
+        VALUES (1, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            revision = excluded.revision,
+            baseline_version = excluded.baseline_version,
+            candidate_version = excluded.candidate_version,
+            candidate_percent = excluded.candidate_percent,
+            updated_at = excluded.updated_at
+        """,
+        (current_revision + 1, baseline_version, candidate_version, candidate_percent, updated_at),
+    )
+    return {
+        "revision": current_revision + 1,
+        "baseline_version": baseline_version,
+        "candidate_version": candidate_version,
+        "candidate_percent": candidate_percent,
+        "updated_at": updated_at,
+    }

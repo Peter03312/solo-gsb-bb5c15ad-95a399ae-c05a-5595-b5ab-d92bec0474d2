@@ -36,6 +36,17 @@ CREATE TABLE IF NOT EXISTS version_rules (
     targets    TEXT NOT NULL,
     PRIMARY KEY (version, match_type, match_key)
 );
+
+-- 默认投递策略：单行（id 恒为 1）。未配置时行不存在，策略修订号视为 0。
+-- 仅引用已发布版本；版本不可变、不可删除，外键长期有效。
+CREATE TABLE IF NOT EXISTS delivery_policy (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    revision          INTEGER NOT NULL,                 -- 策略修订号，每次成功更新 +1
+    baseline_version  INTEGER NOT NULL REFERENCES versions (version),
+    candidate_version INTEGER NOT NULL REFERENCES versions (version),
+    candidate_percent INTEGER NOT NULL CHECK (candidate_percent BETWEEN 0 AND 100),
+    updated_at        TEXT NOT NULL
+);
 """
 
 

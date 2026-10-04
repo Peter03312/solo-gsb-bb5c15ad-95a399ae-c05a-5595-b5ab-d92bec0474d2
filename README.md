@@ -17,6 +17,14 @@
 - **历史版本**：所有发布版本永久可查，按任意历史版本解析可复现当时的结果。
 - **发布前预览**：`POST /preview` 在同一只读快照内对比当前草稿与某个已发布版本，
   列出投递结果有变化的入口地址与域兜底类别（附两侧完整结果）；只读，不改动草稿或历史版本。
+- **默认投递策略（灰度）**：管理员用 `PUT /policy` 提交**基线版本、候选版本、候选流量比例（整数 0～100）
+  与所见策略修订号**；两个版本都必须是已发布版本，在单个 `BEGIN IMMEDIATE` 事务内核验修订号并保存，
+  修订号冲突（409）或引用未发布版本（422）都不会覆盖原策略。
+  `POST /deliver` 只输入收件地址：按**规范化地址稳定分桶**（SHA-256，仅依赖地址本身），
+  同一地址在同一策略下总选同一版本；`0%` / `100%` 分别全选基线 / 候选。
+  选中版本中的**拒收 / 无路由 / 成环仍整次失败，不自动改用另一版本**；
+  未配置策略时明确报错（409），**不使用草稿或最新版本兜底**。
+  策略只决定“默认用哪个已发布版本”，不影响显式版本解析，草稿与历史版本也不会被策略改写。
 
 ## 一键启动（Docker Compose）
 
@@ -62,8 +70,11 @@ pytest tests/ -q                                   # 运行测试
 | POST | `/publish`        | 核对修订号 + 全量校验后发布不可变版本  |
 | GET  | `/versions`       | 列出全部已发布版本                     |
 | GET  | `/versions/{n}`   | 查看某个历史版本的完整规则             |
-| POST | `/resolve`        | 按指定版本解析收件地址                 |
+| POST | `/resolve`        | 按指定版本解析收件地址（显式版本，兼容） |
 | POST | `/preview`        | 预览当前草稿相对基线版本的投递变化     |
+| GET  | `/policy`         | 查看当前默认投递策略（未配置时 404）   |
+| PUT  | `/policy`         | 配置基线/候选版本与候选比例，需策略修订号 |
+| POST | `/deliver`        | 默认投递：按策略对收件地址稳定分桶解析 |
 
 ## 调用示例
 
@@ -209,6 +220,88 @@ curl -X POST http://localhost:8000/preview -H 'Content-Type: application/json' \
 > 上例为节选：该场景下 `boss@`、`assistant@` 等经由 `team@` 的入口也会一并出现在
 > `changed_addresses` 中。
 
+## 默认投递策略：已发布版本间的灰度
+
+管理员可以让某个**已发布候选版本**按流量比例可控地成为默认投递结果，基线版本承接其余流量。
+
+### 6. 配置策略（基线 / 候选 / 比例 / 策略修订号）
+
+```bash
+curl -X PUT http://localhost:8000/policy -H 'Content-Type: application/json' -d '{
+  "baseline_version": 1,
+  "candidate_version": 2,
+  "candidate_percent": 20,
+  "revision": 0
+}'
+```
+
+- 只接受**已发布版本**：`baseline_version` / `candidate_version` 任一不存在（或指向草稿）→
+  `422 {"error": "version_not_published", ...}`，事务回滚，原策略不变。
+- `revision` 为客户端**所见策略修订号**；从未配置时修订号为 `0`，每次成功更新 `+1`。
+  修订号过期返回 `409`（`revision_conflict`，附 `current_revision`），冲突不覆盖原策略。
+- `candidate_percent` 为整数 `0～100`（请求体层强制），越界返回 `422`。
+
+成功响应即当前策略：
+
+```json
+{"revision": 1, "baseline_version": 1, "candidate_version": 2, "candidate_percent": 20, "updated_at": "2026-10-04T01:16:03+00:00"}
+```
+
+查看当前策略：`GET /policy`（未配置时 `404 {"error": "policy_not_configured", "revision": 0}`）。
+
+策略修订号与草稿修订号相互独立；改策略不会修改草稿、历史版本，也不会让任何已发布版本被改写。
+
+### 7. 默认投递：只给收件地址
+
+```bash
+curl -X POST http://localhost:8000/deliver -H 'Content-Type: application/json' \
+  -d '{"address": "boss@corp.example.com"}'
+```
+
+服务先把地址规范化（去空白、小写），再对地址本身做 SHA-256 稳定分桶（桶号 0–99）：
+桶号 `< candidate_percent` 选候选，否则选基线。**同一地址在同一策略下永远选同一版本**；
+调整比例只会移动分桶边界（地址随比例单调地从基线侧进入候选侧），不会来回抖动。
+`0%` 时所有地址选基线，`100%` 时所有地址选候选。
+
+```json
+{
+  "address": "boss@corp.example.com",
+  "policy_revision": 1,
+  "baseline_version": 1,
+  "candidate_version": 2,
+  "candidate_percent": 20,
+  "selection": "candidate",
+  "version": 2,
+  "endpoints": [
+    {"mailbox": "alice@mail.example.com", "paths": [["boss@corp.example.com", "alice@mail.example.com"]]}
+  ]
+}
+```
+
+`endpoints` 的形状与 `/resolve` 完全一致（原有终点与到达路径）；`selection` 为
+`"baseline"` / `"candidate"`，`version` 为实际选中的版本号。
+
+失败约定：
+
+- **未配置策略** → `409 {"error": "policy_not_configured", ...}`；不会使用草稿或最新发布版本兜底。
+- **选中版本**解析出**拒收 / 无路由 / 成环** → 与 `/resolve` 相同的 `422`
+  （`error` 仍为 `rejected` / `no_route` / `cycle`，附原有 `address`、`chain`），
+  **整次失败，不自动改用另一版本**；错误详情额外附 `version`、`selection`、`policy_revision`。
+- 无效地址 → `422 {"error": "invalid_address", ...}`。
+
+```bash
+# 100% 候选后，命中候选拒收规则：失败，不会退回基线
+curl -X POST http://localhost:8000/deliver -H 'Content-Type: application/json' \
+  -d '{"address": "blocked@corp.example.com"}'
+# => 422 {"detail": {"error": "rejected", ..., "policy_revision": 2, "version": 2, "selection": "candidate"}}
+```
+
+### 8. 显式版本解析保持兼容
+
+`POST /resolve` 的请求（必须带 `version`）、成功响应与错误约定（`404 version_not_found`、
+`422` 的 `rejected` / `no_route` / `cycle` / `invalid_address`）完全不变，不受任何策略影响；
+草稿与历史版本同样不随策略变更而改写。需要强制指定版本复现结果时继续使用 `/resolve`。
+
 ## 项目结构
 
 ```
@@ -216,10 +309,11 @@ app/
   config.py    # 环境变量配置
   db.py        # SQLite 连接、建表、BEGIN IMMEDIATE 事务、只读快照事务
   routing.py   # 地址校验、规则集、逐跳解析、发布前全量校验
+  traffic.py   # 默认投递的稳定分桶：规范化地址 → 0–99 桶 → 基线/候选
   preview.py   # 发布前预览：草稿 vs 基线版本的投递差异对比（纯内存，不落库）
   models.py    # 请求模型与编辑期校验（无效地址/重复规则/空目标）
-  store.py     # 草稿与版本的持久化、修订号核对
-  main.py      # FastAPI 路由
-tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览
+  store.py     # 草稿、发布版本与默认投递策略的持久化、修订号核对
+  main.py      # FastAPI 路由（/resolve、/preview、/policy、/deliver 等）
+tests/         # pytest：API 全流程 + 解析单元测试 + 发布前预览 + 灰度策略
 Dockerfile / docker-compose.yml
 ```
