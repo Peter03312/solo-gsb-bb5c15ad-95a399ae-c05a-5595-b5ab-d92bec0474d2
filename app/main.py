@@ -1,4 +1,5 @@
-"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览。"""
+"""HTTP API：草稿编辑（乐观锁）、发布（原子校验 + 不可变版本）、按版本解析、发布前预览、
+默认投递策略（基线 / 候选灰度）与默认投递查询。"""
 from __future__ import annotations
 
 import sqlite3
@@ -7,7 +8,17 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 
 from . import db, preview, store
-from .models import DraftUpdate, PreviewRequest, PublishRequest, ResolveRequest, ValidationFailure, normalize_rules
+from .models import (
+    DeliverRequest,
+    DraftUpdate,
+    PolicyUpdate,
+    PreviewRequest,
+    PublishRequest,
+    ResolveRequest,
+    ValidationFailure,
+    normalize_rules,
+)
+from .rollout import pick_version
 from .routing import ResolutionError, RuleSet, is_valid_address, resolve, validate_ruleset
 
 
@@ -25,6 +36,14 @@ def _conflict(exc: store.RevisionConflict) -> HTTPException:
         status_code=409,
         detail={"error": "revision_conflict", "current_revision": exc.current, "message": str(exc)},
     )
+
+
+def _endpoints_payload(endpoints: dict[str, list[list[str]]]) -> list[dict]:
+    """/resolve 与 /deliver 共用的成功响应主体：终点去重、路径排序。"""
+    return [
+        {"mailbox": mailbox, "paths": sorted(paths)}
+        for mailbox, paths in sorted(endpoints.items())
+    ]
 
 
 @app.get("/health")
@@ -115,10 +134,7 @@ def resolve_address(body: ResolveRequest) -> dict:
     return {
         "address": address,
         "version": body.version,
-        "endpoints": [
-            {"mailbox": mailbox, "paths": sorted(paths)}
-            for mailbox, paths in sorted(endpoints.items())
-        ],
+        "endpoints": _endpoints_payload(endpoints),
     }
 
 
@@ -147,3 +163,76 @@ def preview_changes(body: PreviewRequest) -> dict:
         raise _conflict(exc)
     diff = preview.preview(base_rules, draft_rules)
     return {"base_version": body.base_version, "revision": revision, **diff}
+
+
+# ---------- 默认投递策略：基线 / 候选版本 + 候选流量比例 ----------
+
+
+@app.get("/policy")
+def get_policy() -> dict:
+    """查看当前默认投递策略（含策略修订号）；未配置时 policy 为 null。"""
+    with db.connect() as conn:
+        revision, policy = store.get_policy(conn)
+    return {"revision": revision, "policy": policy}
+
+
+@app.put("/policy")
+def put_policy(body: PolicyUpdate) -> dict:
+    """提交默认投递策略：只接受已发布版本；同一事务内核对修订号并保存，冲突不覆盖原策略。"""
+    try:
+        with db.transaction() as conn:
+            for version in (body.base_version, body.candidate_version):
+                if not store.version_exists(conn, version):
+                    raise HTTPException(
+                        status_code=404,
+                        detail={"error": "version_not_found", "version": version},
+                    )
+            new_revision = store.save_policy(
+                conn, body.revision, body.base_version, body.candidate_version, body.candidate_percent
+            )
+    except store.RevisionConflict as exc:
+        raise _conflict(exc)
+    except sqlite3.OperationalError as exc:  # 并发写冲突
+        raise HTTPException(status_code=409, detail={"error": "write_conflict", "message": str(exc)})
+    return {
+        "revision": new_revision,
+        "policy": {
+            "base_version": body.base_version,
+            "candidate_version": body.candidate_version,
+            "candidate_percent": body.candidate_percent,
+        },
+    }
+
+
+@app.post("/deliver")
+def deliver(body: DeliverRequest) -> dict:
+    """默认投递查询：按当前策略对规范化地址稳定分桶，选中基线或候选版本后解析。
+
+    同一地址在同一策略下总选中同一版本；0% 全选基线、100% 全选候选。
+    选中版本中的拒收 / 无路由 / 成环仍整次失败（422），不自动改用另一版本。
+    未配置策略时明确报错（404 policy_not_configured），不使用草稿或最新版本。
+    """
+    address = body.address.strip().lower()
+    if not is_valid_address(address):
+        raise HTTPException(status_code=422, detail={"error": "invalid_address", "message": f"invalid address: {body.address!r}"})
+    with db.connect() as conn:
+        policy_revision, policy = store.get_policy(conn)
+        if policy is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "policy_not_configured", "message": "no delivery policy configured"},
+            )
+        version = pick_version(address, policy)
+        ruleset = store.load_ruleset(conn, version)
+    if ruleset is None:  # 策略只引用已发布版本且版本不可变，正常不会走到
+        raise HTTPException(status_code=404, detail={"error": "version_not_found", "version": version})
+    try:
+        endpoints = resolve(address, ruleset)
+    except ResolutionError as exc:
+        raise HTTPException(status_code=422, detail=exc.detail())
+    return {
+        "address": address,
+        "policy_revision": policy_revision,
+        "version": version,
+        "endpoints": _endpoints_payload(endpoints),
+    }

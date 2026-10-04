@@ -1,4 +1,4 @@
-"""持久层：草稿（带乐观锁修订号）与不可变发布版本。"""
+"""持久层：草稿（带乐观锁修订号）、不可变发布版本与默认投递策略。"""
 from __future__ import annotations
 
 import json
@@ -9,10 +9,10 @@ from .routing import Rule, RuleSet, Target
 
 
 class RevisionConflict(Exception):
-    """所见修订号与当前草稿不一致。"""
+    """所见修订号与当前（草稿或策略）修订号不一致。"""
 
     def __init__(self, current: int):
-        super().__init__(f"revision conflict: current draft revision is {current}")
+        super().__init__(f"revision conflict: current revision is {current}")
         self.current = current
 
 
@@ -123,3 +123,46 @@ def load_ruleset(conn: sqlite3.Connection, version: int) -> RuleSet | None:
     if found is None:
         return None
     return RuleSet(found["rules"])
+
+
+def version_exists(conn: sqlite3.Connection, version: int) -> bool:
+    """版本是否已发布（不加载规则内容）。"""
+    row = conn.execute("SELECT 1 FROM versions WHERE version = ?", (version,)).fetchone()
+    return row is not None
+
+
+# ---------- 默认投递策略（单行，乐观锁修订号） ----------
+
+
+def get_policy(conn: sqlite3.Connection) -> tuple[int, dict | None]:
+    """当前默认投递策略：(修订号, 策略)；未配置时策略为 None（修订号仍为 0 起的当前值）。"""
+    row = conn.execute(
+        "SELECT revision, base_version, candidate_version, candidate_percent FROM policy WHERE id = 1"
+    ).fetchone()
+    if row["base_version"] is None:
+        return row["revision"], None
+    return row["revision"], {
+        "base_version": row["base_version"],
+        "candidate_version": row["candidate_version"],
+        "candidate_percent": row["candidate_percent"],
+    }
+
+
+def save_policy(
+    conn: sqlite3.Connection,
+    expected_revision: int,
+    base_version: int,
+    candidate_version: int,
+    candidate_percent: int,
+) -> int:
+    """保存默认投递策略；修订号不匹配抛 RevisionConflict（原策略不被覆盖）。须在事务内调用。"""
+    revision, _ = get_policy(conn)
+    if revision != expected_revision:
+        raise RevisionConflict(revision)
+    new_revision = revision + 1
+    conn.execute(
+        "UPDATE policy SET revision = ?, base_version = ?, candidate_version = ?, candidate_percent = ? "
+        "WHERE id = 1",
+        (new_revision, base_version, candidate_version, candidate_percent),
+    )
+    return new_revision

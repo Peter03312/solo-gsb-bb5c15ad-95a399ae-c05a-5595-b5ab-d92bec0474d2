@@ -1,4 +1,4 @@
-"""SQLite 存储层：草稿（带乐观锁修订号）与不可变发布版本。"""
+"""SQLite 存储层：草稿（带乐观锁修订号）、不可变发布版本与默认投递策略。"""
 from __future__ import annotations
 
 import os
@@ -36,6 +36,17 @@ CREATE TABLE IF NOT EXISTS version_rules (
     targets    TEXT NOT NULL,
     PRIMARY KEY (version, match_type, match_key)
 );
+
+-- 默认投递策略（单行）：基线 / 候选已发布版本 + 候选流量比例，带乐观锁修订号。
+-- 未配置时 revision = 0 且三个版本/比例列为 NULL。
+CREATE TABLE IF NOT EXISTS policy (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    revision          INTEGER NOT NULL,
+    base_version      INTEGER,
+    candidate_version INTEGER,
+    candidate_percent INTEGER CHECK (candidate_percent BETWEEN 0 AND 100)
+);
+INSERT OR IGNORE INTO policy (id, revision) VALUES (1, 0);
 """
 
 
